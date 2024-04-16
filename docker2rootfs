@@ -1,0 +1,168 @@
+#!/bin/bash
+
+# 检查 .cpio.gz 文件和目标目录是否已经存在
+check_existing_files() {
+    if [ -f "$cpio_file" ] || [ -d "$destination_directory" ]; then
+        if [ "$force_overwrite" = true ]; then
+            echo "File $cpio_file or directory $destination_directory already exists. Overwriting..."
+            rm -rf "$cpio_file" "$destination_directory"
+        else
+            echo "Error: File $cpio_file or directory $destination_directory already exists. Use -f to force overwrite."
+            exit 1
+        fi
+    fi
+}
+
+# 创建临时目录
+create_temp_directory() {
+    temp_directory=$(mktemp -d)
+    echo "Created temporary directory: $temp_directory"
+}
+
+# 将 Docker 镜像保存为 tar 文件
+save_docker_image() {
+    echo "Saving Docker image $image_name to $temp_directory/image.tar"
+    if ! docker save $image_name -o $temp_directory/image.tar; then
+        echo "Error: Failed to save Docker image"
+        rm -rf $temp_directory
+        exit 1
+    fi
+}
+
+# 创建目标目录
+create_destination_directory() {
+    echo "Creating destination directory $destination_directory"
+    if ! mkdir -p $destination_directory; then
+        echo "Error: Failed to create destination directory"
+        rm -rf $temp_directory
+        exit 1
+    fi
+}
+
+# 解压 Docker 镜像的 tar 文件
+extract_docker_image() {
+    echo "Extracting Docker image tar file to $temp_directory"
+    if ! tar -xf $temp_directory/image.tar -C $temp_directory; then
+        echo "Error: Failed to extract Docker image tar file"
+        rm -rf $temp_directory
+        exit 1
+    fi
+}
+
+# 找到 manifest.json 文件
+find_manifest_file() {
+    manifest_file=$(find $temp_directory -name "manifest.json")
+    echo "Found manifest.json file: $manifest_file"
+
+    if [ -z "$manifest_file" ]; then
+        echo "Error: manifest.json not found"
+        rm -rf $temp_directory
+        exit 1
+    fi
+}
+
+# 按照从下到上的顺序合并层
+merge_layers() {
+    echo "Merging layers..."
+    for layer in $(jq -r '.[0].Layers | .[]' $manifest_file); do
+        echo "Extracting layer $layer"
+        if ! tar -xf $temp_directory/$layer -C $destination_directory; then
+            echo "Error: Failed to extract layer $layer"
+            rm -rf $temp_directory
+            exit 1
+        fi
+    done
+}
+
+# 创建 init 文件
+create_init_file() {
+    echo "Creating init file..."
+    cat > $destination_directory/init <<EOF
+#!/bin/bash
+
+/bin/mount -t devtmpfs devtmpfs /dev
+/bin/mount -t proc none /proc
+/bin/mount -t sysfs none /sys
+
+/sbin/mdev -s
+
+# 配置网络
+ip link set eth0 up
+ip addr add 10.0.2.15/24 dev eth0  
+ip route add default via 10.0.2.2
+
+# 定义一个函数来处理 SIGINT 信号
+sigint_handler() {
+    echo "Caught SIGINT, exiting..."
+    exit
+}
+
+# 设置 SIGINT 信号的处理函数
+trap sigint_handler SIGINT
+
+# 启动一个新的 bash 实例
+exec /bin/bash
+
+EOF
+
+    chmod +x $destination_directory/init
+}
+
+# 创建 .cpio.gz 文件
+create_cpio_file() {
+    echo "Creating $cpio_file..."
+    if ! (cd $destination_directory && find . -print0 | cpio --null -ov --format=newc | gzip -9 > ../$cpio_file); then
+        echo "Error: Failed to create $cpio_file"
+        rm -rf $temp_directory
+        exit 1
+    fi
+}
+
+# 删除临时目录
+cleanup_temp_directory() {
+    echo "Cleaning up temporary directory"
+    rm -rf $temp_directory
+}
+
+# 主函数
+main() {
+    # 检查参数数量
+    if [ $# -lt 2 ] || [ $# -gt 3 ]; then
+        echo "Usage: $0 <image_name> <destination_directory> [-f]"
+        exit 1
+    fi
+
+    # 获取参数
+    image_name=$1
+    destination_directory=$2
+
+    # 检查是否提供了 -f 选项
+    if [ $# -eq 3 ]; then
+        if [ "$3" = "-f" ]; then
+            force_overwrite=true
+        else
+            echo "Invalid option: $3. Use -f to force overwrite."
+            exit 1
+        fi
+    else
+        force_overwrite=false
+    fi
+
+    # 生成 .cpio.gz 文件的名称
+    cpio_file="$(basename $destination_directory).cpio.gz"
+
+    check_existing_files
+    create_temp_directory
+    save_docker_image
+    create_destination_directory
+    extract_docker_image
+    find_manifest_file
+    merge_layers
+    create_init_file
+    create_cpio_file
+    cleanup_temp_directory
+
+    echo "Successfully extracted rootfs to $destination_directory and created $cpio_file"
+}
+
+main "$@"
